@@ -5,15 +5,43 @@ This module implements various clustering algorithms for grouping
 similar Suricata rules together.
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import dendrogram, linkage
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering, MiniBatchKMeans
+from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from tqdm import tqdm
+
+
+def apply_pca(X: np.ndarray, n_components: int = 50, variance_threshold: float = 0.95) -> Tuple[np.ndarray, PCA]:
+    """
+    Apply PCA dimensionality reduction to feature matrix.
+
+    Args:
+        X: Feature matrix
+        n_components: Target number of components (default: 50)
+        variance_threshold: Minimum variance to preserve (default: 0.95)
+
+    Returns:
+        Tuple of (transformed_X, pca_model)
+    """
+    # Don't apply PCA if already low dimensional
+    if X.shape[1] <= n_components:
+        print(f"Feature matrix has {X.shape[1]} dimensions, skipping PCA")
+        return X, None
+
+    print(f"Applying PCA: {X.shape[1]} dimensions → {n_components} dimensions...")
+    pca = PCA(n_components=n_components, random_state=42)
+    X_reduced = pca.fit_transform(X)
+
+    variance_explained = pca.explained_variance_ratio_.sum()
+    print(f"PCA explained variance: {variance_explained:.2%}")
+
+    return X_reduced, pca
 
 
 class RuleClusterer:
@@ -44,6 +72,8 @@ class RuleClusterer:
         """
         if self.algorithm == 'kmeans':
             self.model = self._fit_kmeans(X)
+        elif self.algorithm == 'minibatch_kmeans':
+            self.model = self._fit_minibatch_kmeans(X)
         elif self.algorithm == 'dbscan':
             self.model = self._fit_dbscan(X)
         elif self.algorithm == 'hierarchical':
@@ -69,6 +99,25 @@ class RuleClusterer:
         )
         model.fit(X)
         print(f"K-Means converged in {model.n_iter_} iterations")
+        return model
+
+    def _fit_minibatch_kmeans(self, X: np.ndarray) -> MiniBatchKMeans:
+        """Fit Mini-Batch K-Means clustering (faster alternative to K-Means)."""
+        n_clusters = self.params.get('n_clusters', 8)
+        random_state = self.params.get('random_state', 42)
+        max_iter = self.params.get('max_iter', 300)
+        batch_size = self.params.get('batch_size', 1024)
+
+        print(f"Fitting Mini-Batch K-Means with {n_clusters} clusters...")
+        model = MiniBatchKMeans(
+            n_clusters=n_clusters,
+            random_state=random_state,
+            max_iter=max_iter,
+            batch_size=batch_size,
+            n_init=3
+        )
+        model.fit(X)
+        print(f"Mini-Batch K-Means completed")
         return model
 
     def _fit_dbscan(self, X: np.ndarray) -> DBSCAN:
@@ -117,7 +166,7 @@ class RuleClusterer:
         """
         Predict cluster labels for new data.
 
-        Note: Only works for K-Means. Other algorithms don't support prediction.
+        Note: Only works for K-Means and Mini-Batch K-Means. Other algorithms don't support prediction.
 
         Args:
             X: Feature matrix
@@ -125,7 +174,7 @@ class RuleClusterer:
         Returns:
             Cluster labels
         """
-        if self.algorithm == 'kmeans':
+        if self.algorithm in ['kmeans', 'minibatch_kmeans']:
             return self.model.predict(X)
         else:
             raise NotImplementedError(
@@ -156,6 +205,44 @@ class RuleClusterer:
         }).rename(columns={'sid': 'rule_count'})
 
         return summary
+
+    def get_cluster_centers(self) -> Optional[np.ndarray]:
+        """
+        Get cluster centers/centroids if available.
+
+        Returns:
+            Cluster centers for K-Means/Mini-Batch K-Means, None for other algorithms
+        """
+        if self.algorithm in ['kmeans', 'minibatch_kmeans']:
+            return self.model.cluster_centers_
+        return None
+
+    def describe_clusters(
+        self,
+        X: np.ndarray,
+        df: pd.DataFrame,
+        feature_extractor=None
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Generate comprehensive descriptions for all clusters.
+
+        Args:
+            X: Feature matrix
+            df: DataFrame with parsed rules
+            feature_extractor: Optional RuleFeatureExtractor instance
+
+        Returns:
+            Dictionary mapping cluster_id to description
+        """
+        from .cluster_analysis import ClusterDescriptor
+
+        if self.labels_ is None:
+            raise ValueError("Model must be fitted before describing clusters")
+
+        descriptor = ClusterDescriptor(feature_extractor=feature_extractor)
+        cluster_centers = self.get_cluster_centers()
+
+        return descriptor.describe_all_clusters(X, self.labels_, df, cluster_centers)
 
 
 def evaluate_clustering(X: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
@@ -278,19 +365,43 @@ def plot_dendrogram(X: np.ndarray, max_samples: int = 1000, **kwargs):
 def compare_algorithms(
         X: np.ndarray,
         df: pd.DataFrame,
-        algorithms: list = None
+        algorithms: list = None,
+        max_samples: int = 10000,
+        apply_pca_reduction: bool = True,
+        pca_components: int = 50
 ) -> pd.DataFrame:
     """
-    Compare different clustering algorithms.
+    Compare different clustering algorithms with optimizations for speed.
 
     Args:
         X: Feature matrix
         df: Original DataFrame with parsed rules
         algorithms: List of algorithm configurations to compare
+        max_samples: Maximum number of samples to use (default: 10000)
+        apply_pca_reduction: Whether to apply PCA dimensionality reduction (default: True)
+        pca_components: Number of PCA components (default: 50)
 
     Returns:
         DataFrame comparing algorithm performance
     """
+    # Sample the dataset for faster comparison
+    n_samples = X.shape[0]
+    if n_samples > max_samples:
+        print(f"\nSampling dataset: {n_samples} → {max_samples} samples for faster comparison")
+        indices = np.random.choice(n_samples, max_samples, replace=False)
+        X_sample = X[indices]
+        df_sample = df.iloc[indices].copy()
+    else:
+        print(f"\nUsing full dataset: {n_samples} samples")
+        X_sample = X
+        df_sample = df.copy()
+
+    # Apply PCA dimensionality reduction
+    if apply_pca_reduction:
+        X_sample, pca_model = apply_pca(X_sample, n_components=pca_components)
+    else:
+        pca_model = None
+
     if algorithms is None:
         algorithms = [
             {'name': 'K-Means (k=5)', 'algorithm': 'kmeans', 'params': {'n_clusters': 5}},
@@ -298,7 +409,7 @@ def compare_algorithms(
             {'name': 'K-Means (k=10)', 'algorithm': 'kmeans', 'params': {'n_clusters': 10}},
             {'name': 'DBSCAN (eps=0.5)', 'algorithm': 'dbscan', 'params': {'eps': 0.5, 'min_samples': 5}},
             {'name': 'DBSCAN (eps=1.0)', 'algorithm': 'dbscan', 'params': {'eps': 1.0, 'min_samples': 5}},
-            {'name': 'Hierarchical (k=8)', 'algorithm': 'hierarchical', 'params': {'n_clusters': 8}},
+            {'name': 'Mini-Batch K-Means (k=8)', 'algorithm': 'minibatch_kmeans', 'params': {'n_clusters': 8}},
         ]
 
     results = []
@@ -309,10 +420,12 @@ def compare_algorithms(
             algorithm=config['algorithm'],
             **config['params']
         )
-        clusterer.fit(X)
+        clusterer.fit(X_sample)
 
-        metrics = evaluate_clustering(X, clusterer.labels_)
+        metrics = evaluate_clustering(X_sample, clusterer.labels_)
         metrics['algorithm'] = config['name']
+        metrics['n_samples_used'] = X_sample.shape[0]
+        metrics['n_features'] = X_sample.shape[1]
 
         results.append(metrics)
 

@@ -212,5 +212,6 @@ CLAUDE.md
 
 data/
 rules/
+outputs/
 
 .DS_Store

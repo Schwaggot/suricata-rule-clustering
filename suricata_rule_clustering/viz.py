@@ -10,8 +10,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 from umap import UMAP
 
 
@@ -20,22 +21,50 @@ def reduce_dimensions(
     method: str = 'umap',
     n_components: int = 2,
     random_state: int = 42,
+    max_samples: int = 50000,
+    apply_pca: bool = True,
+    pca_components: int = 50,
+    n_jobs: int = -1,
     **kwargs
-) -> np.ndarray:
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
-    Reduce dimensionality of feature matrix for visualization.
+    Reduce dimensionality of feature matrix for visualization with performance optimizations.
 
     Args:
         X: Feature matrix
         method: Dimensionality reduction method ('umap' or 'tsne')
         n_components: Number of dimensions to reduce to (2 or 3)
         random_state: Random state for reproducibility
+        max_samples: Maximum number of samples to use (default: 50000)
+        apply_pca: Whether to apply PCA preprocessing (default: True)
+        pca_components: Number of PCA components for preprocessing (default: 50)
+        n_jobs: Number of parallel jobs (-1 for all cores, default: -1)
         **kwargs: Additional parameters for the reduction method
 
     Returns:
-        Reduced feature matrix
+        Tuple of (reduced_matrix, sample_indices) where sample_indices is None if no sampling
     """
-    print(f"Reducing {X.shape[1]} dimensions to {n_components} using {method.upper()}...")
+    n_samples_orig = X.shape[0]
+    sample_indices = None
+
+    # Sample the dataset if it's too large
+    if n_samples_orig > max_samples:
+        print(f"Sampling dataset: {n_samples_orig} → {max_samples} samples for faster visualization")
+        sample_indices = np.random.choice(n_samples_orig, max_samples, replace=False)
+        X_work = X[sample_indices]
+    else:
+        print(f"Using full dataset: {n_samples_orig} samples")
+        X_work = X
+
+    # Apply PCA preprocessing to speed up UMAP/t-SNE
+    if apply_pca and X_work.shape[1] > pca_components:
+        print(f"Applying PCA preprocessing: {X_work.shape[1]} → {pca_components} dimensions")
+        pca = PCA(n_components=pca_components, random_state=random_state)
+        X_work = pca.fit_transform(X_work)
+        variance_explained = pca.explained_variance_ratio_.sum()
+        print(f"PCA explained variance: {variance_explained:.2%}")
+
+    print(f"Reducing {X_work.shape[1]} dimensions to {n_components} using {method.upper()}...")
 
     if method.lower() == 'umap':
         reducer = UMAP(
@@ -43,22 +72,51 @@ def reduce_dimensions(
             random_state=random_state,
             n_neighbors=kwargs.get('n_neighbors', 15),
             min_dist=kwargs.get('min_dist', 0.1),
-            metric=kwargs.get('metric', 'euclidean')
+            metric=kwargs.get('metric', 'euclidean'),
+            n_jobs=n_jobs,  # Enable parallelism
+            verbose=kwargs.get('verbose', False)
         )
     elif method.lower() == 'tsne':
-        reducer = TSNE(
-            n_components=n_components,
-            random_state=random_state,
-            perplexity=kwargs.get('perplexity', 30),
-            n_iter=kwargs.get('n_iter', 1000)
-        )
+        # For large datasets, reduce perplexity and iterations
+        perplexity = kwargs.get('perplexity', 30)
+        n_iter = kwargs.get('n_iter', kwargs.get('max_iter', 1000))
+
+        # Adjust parameters for large datasets
+        if X_work.shape[0] > 10000:
+            perplexity = min(perplexity, 50)  # Cap perplexity
+            n_iter = min(n_iter, 500)  # Reduce iterations for speed
+            print(f"t-SNE parameters adjusted for large dataset: perplexity={perplexity}, iterations={n_iter}")
+
+        # Build base parameters
+        import inspect
+        tsne_params = {
+            'n_components': n_components,
+            'random_state': random_state,
+            'perplexity': perplexity,
+        }
+
+        # Check parameter names for this scikit-learn version
+        tsne_signature = inspect.signature(TSNE.__init__).parameters
+
+        # Add iterations parameter (name changed between sklearn versions)
+        if 'max_iter' in tsne_signature:
+            tsne_params['max_iter'] = n_iter
+        elif 'n_iter' in tsne_signature:
+            tsne_params['n_iter'] = n_iter
+
+        # Add n_jobs if supported (scikit-learn 0.22+)
+        if 'n_jobs' in tsne_signature:
+            tsne_params['n_jobs'] = n_jobs
+            print(f"t-SNE using {n_jobs if n_jobs > 0 else 'all'} CPU cores")
+
+        reducer = TSNE(**tsne_params)
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    X_reduced = reducer.fit_transform(X)
-    print(f"Dimensionality reduction complete: {X.shape} -> {X_reduced.shape}")
+    X_reduced = reducer.fit_transform(X_work)
+    print(f"Dimensionality reduction complete: {X_work.shape} -> {X_reduced.shape}")
 
-    return X_reduced
+    return X_reduced, sample_indices
 
 
 def plot_clusters_2d(
